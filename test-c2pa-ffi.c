@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <errno.h>
 #include "c2pa.h"
 #include <cjson/cJSON.h>
@@ -182,13 +183,138 @@ bool check_for_provenance(const char *recipe, bool *detailed) {
     return prov_check;
 }
 
+/**
+ * Populates a C2PA manifest JSON string using cJSON.
+ *
+ * @param filename         The source filename to set as "title".
+ * @param mimetype         The MIME type to set as "format".
+ * @param recipe           A JSON string with an "manipulations" array (optional unless detailed=true).
+ * @param c2pa_manifest    An input base manifest that will be deep-copied and updated.
+ * @param detailed         If true, parse the recipe/manipulations and append mapped actions.
+ *
+ * @return A newly allocated JSON string (compact) on success, or NULL on error.
+ *         Caller must free it using cJSON_free() (or free() if default allocators are used).
+ */
+char *populate_manifest(const char *filename,
+                        char *mimetype,
+                        const char *recipe,
+                        char *c2pa_manifest,
+                        bool detailed)
+{
+    if (!filename || !mimetype || !c2pa_manifest || !recipe) {
+        printf("Invalid arguments: filename/mimetype/manifest/recipe.\n");
+        return NULL;
+    }
+
+    // Deep copy the provided manifest
+    cJSON *base_manifest = cJSON_Parse(c2pa_manifest);
+    cJSON *manifest = cJSON_Duplicate(base_manifest, 1);
+
+    // Set "title" and "format" (mimetype)
+    cJSON_AddStringToObject(manifest, "title", filename);
+    cJSON_AddStringToObject(manifest, "format", mimetype);
+
+    cJSON *recipe_root = NULL;
+    cJSON *actions = NULL;
+
+    // If detailed is requested, parse the recipe and map manipulations to c2pa actions
+    if (detailed) {
+
+        recipe_root = cJSON_Parse(recipe);
+        if (!recipe_root) {
+            printf("Error parsing recipe JSON.\n");
+            cJSON_Delete(manifest);
+            return NULL;
+        }
+
+        cJSON *manipulations = cJSON_GetObjectItemCaseSensitive(recipe_root, "manipulations");
+        if (!cJSON_IsArray(manipulations)) {
+            printf("Can't parse manipulations from imagechef recipe: 'manipulations' must be an array.\n");
+            cJSON_Delete(recipe_root);
+            cJSON_Delete(manifest);
+            return NULL;
+        }
+
+        actions = cJSON_CreateArray();
+
+        // Iterate manipulations and map to c2pa actions
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, manipulations) {
+            cJSON *method = cJSON_GetObjectItemCaseSensitive(item, "method");
+            if (!cJSON_IsString(method) || !method->valuestring) {
+                continue; // skip invalid entries silently
+            }
+
+            const char *method_str = method->valuestring;
+            const char *action_str = NULL;
+
+            if (strcmp(method_str, "resize") == 0) {
+                action_str = "c2pa.resized";
+            } else if (strcmp(method_str, "unsharpmask") == 0 || strcmp(method_str, "sharpen") == 0) {
+                action_str = "c2pa.filtered";
+            } else if (strcmp(method_str, "stroke") == 0 || strcmp(method_str, "fill") == 0) {
+                action_str = "c2pa.drawing";
+            } else if (strcmp(method_str, "annotate") == 0) {
+                action_str = "c2pa.font.charactersAdded";
+            } else if (strcmp(method_str, "rotate") == 0) {
+                action_str = "c2pa.orientation";
+            } else if (strcmp(method_str, "cropped") == 0) {
+                action_str = "c2pa.cropped";
+            } else if (strcmp(method_str, "setformat") == 0) {
+                action_str = "c2pa.converted";
+            } else if (strcmp(method_str, "resolution") == 0) {
+                action_str = "c2pa.transcoded";
+            } else {
+                // unrecognized: skip
+                continue;
+            }
+
+            cJSON *action_obj = cJSON_CreateObject();
+
+            cJSON_AddStringToObject(action_obj, "action", action_str);
+            cJSON_AddItemToArray(actions, action_obj);
+        }
+
+        // Update manifest's assertions -> c2pa.actions -> data.actions
+        cJSON *assertions = cJSON_GetObjectItemCaseSensitive(manifest, "assertions");
+        if (cJSON_IsArray(assertions)) {
+            cJSON *assertion = NULL;
+            cJSON_ArrayForEach(assertion, assertions) {
+                cJSON *label = cJSON_GetObjectItemCaseSensitive(assertion, "label");
+                if (cJSON_IsString(label) && label->valuestring &&
+                    strcmp(label->valuestring, "c2pa.actions") == 0)
+                {
+                    cJSON *data = cJSON_GetObjectItemCaseSensitive(assertion, "data");
+                    cJSON *existing_actions = cJSON_GetObjectItemCaseSensitive(data, "actions");
+                    // Append copies of new actions
+                    cJSON *action_it = NULL;
+                    cJSON_ArrayForEach(action_it, actions) {
+                        cJSON_AddItemToArray(existing_actions, cJSON_Duplicate(action_it, 1));
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert to compact string
+    char *manifest_str = cJSON_PrintUnformatted(manifest);
+
+    // Cleanup
+    if (actions) cJSON_Delete(actions);
+    if (recipe_root) cJSON_Delete(recipe_root);
+    cJSON_Delete(manifest);
+
+    // Return serialized JSON; caller must free with cJSON_free().
+    return manifest_str;
+}
+
 // ---- Test harness ----
 
 int main() {
 
     int error = 0;
 
-    char *recipe = read_file_to_cstring("/workspace/tmp/prov-bbc-1024x576.json");
+    char *recipe = read_file_to_cstring("/workspace/tmp/prov-detailed-bbc-1024x576.json");
     if (!recipe) {
         printf("Failed to read recipe file\n");
         error = 1;
@@ -223,7 +349,13 @@ int main() {
         printf("Signer created successfully\n");
     }
 
-    const char *manifest = read_file_to_cstring("/workspace/tmp/manifest.json");
+    const char *src = "/workspace/tmp/test.png";
+    const char* dest = "/workspace/tmp/output.png";
+
+    char *png_mime_type = "image/png";
+    const char *base_manifest = read_file_to_cstring("/workspace/tmp/manifest.json");
+
+    char *manifest = populate_manifest("test.png", png_mime_type, recipe, base_manifest, detailed);
 
     C2paBuilder *builder = c2pa_builder_from_json(manifest);
     if (!builder) {
@@ -234,9 +366,6 @@ int main() {
         printf("Builder created successfully\n");
     }
 
-    const char *src = "/workspace/tmp/test.png";
-    const char* dest = "/workspace/tmp/output.png";
-
     // char *res = c2pa_sign_file(src, dest, empty_manifest, &info, NULL);
     // if (!res) {
     //     printf("Signing failed: %s\n", c2pa_error());
@@ -246,7 +375,6 @@ int main() {
     //     printf("Image signed successfully!\n");
     // }
 
-    const char *png_mime_type = "image/png";
     const char* dest_2 = "/workspace/tmp/output_2.png";
     const unsigned char *manifest_bytes = NULL;
 
@@ -294,6 +422,8 @@ cleanup:
     //if (res) c2pa_string_free(res);
     if (builder) c2pa_builder_free(builder);
     if (signer) c2pa_signer_free(signer);
+    if (base_manifest) free(base_manifest);
+    if (manifest) free(manifest);
     if (cert) free(cert);
     if (key) free(key);
     if (recipe) free(recipe);
