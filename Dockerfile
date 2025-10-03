@@ -1,11 +1,11 @@
 # Dockerfile
-FROM 470820891875.dkr.ecr.eu-west-1.amazonaws.com/bbc-el9-ci
+FROM rockylinux:9
 USER root
 
-RUN --mount=type=secret,id=bbc_cert,dst=/etc/pki/tls/certs/client.crt \
-    --mount=type=secret,id=bbc_key,dst=/etc/pki/tls/private/client.key \
+RUN dnf -y update && \
     dnf -y update && \
-    dnf install -y gcc openssl-devel cjson-devel && \
+    dnf install -y gcc epel-release && \
+    dnf install -y cjson-devel unzip && \
     dnf clean all
 
 # Set version and download URL
@@ -30,7 +30,8 @@ WORKDIR /workspace
 
 # Copy the test file into the container
 COPY test-c2pa-ffi.c /workspace/test-c2pa-ffi.c
-COPY resources/* /workspace/tmp/
 
-# Build and run the test
-RUN gcc /workspace/test-c2pa-ffi.c -I/opt/c2pa/include -L/opt/c2pa/lib -lc2pa_c -lcjson -lpthread -ldl -lm -lssl -lcrypto -o /workspace/test-c2pa-ffi
+# Compile the test program
+RUN gcc /workspace/test-c2pa-ffi.c -I/opt/c2pa/include -L/opt/c2pa/lib -lc2pa_c -lcjson -lpthread -ldl -lm -o /workspace/test-c2pa-ffi
+
+CMD ["/workspace/test-c2pa-ffi"]

@@ -7,6 +7,8 @@
 #include "c2pa.h"
 #include <cjson/cJSON.h>
 
+// ---- Memory stream helpers (req by C2PA Rust library) ----
+
 typedef struct {
     uint8_t *buffer;
     size_t length;
@@ -14,8 +16,21 @@ typedef struct {
     size_t pos;
 } MemoryStreamContext;
 
+typedef struct {
+    C2paStream *stream;
+    MemoryStreamContext *ctx;
+} MemoryStream;
+
 // ---- Callbacks ----
-// Read from memory stream
+/**
+ * mem_read: Reads data from a memory stream.
+ *
+ * @param context   Pointer to the MemoryStreamContext.
+ * @param data      Buffer to read data into.
+ * @param len       Number of bytes to read.
+ *
+ * @return Number of bytes actually read, or 0 on EOF.
+ */
 intptr_t mem_read(struct StreamContext *context, uint8_t *data, intptr_t len) {
     MemoryStreamContext *ctx = (MemoryStreamContext *)context;
     if (ctx->pos >= ctx->length) return 0; // EOF
@@ -26,7 +41,15 @@ intptr_t mem_read(struct StreamContext *context, uint8_t *data, intptr_t len) {
     return to_read;
 }
 
-// Write to memory stream
+/**
+ * mem_write: Writes data to a memory stream.
+ *
+ * @param context   Pointer to the MemoryStreamContext.
+ * @param data      Buffer containing data to write.
+ * @param len       Number of bytes to write.
+ *
+ * @return Number of bytes written, or -1 on error.
+ */
 intptr_t mem_write(struct StreamContext *context, const uint8_t *data, intptr_t len) {
     MemoryStreamContext *ctx = (MemoryStreamContext *)context;
 
@@ -44,13 +67,27 @@ intptr_t mem_write(struct StreamContext *context, const uint8_t *data, intptr_t 
     return len;
 }
 
-// Flush (no-op)
+/**
+ * mem_flush: Flushes the memory stream (no-op).
+ *
+ * @param context   Pointer to the MemoryStreamContext.
+ *
+ * @return Always returns 0.
+ */
 intptr_t mem_flush(struct StreamContext *context) {
     (void)context;
     return 0;
 }
 
-// Seek
+/**
+ * mem_seek: Moves the position within a memory stream.
+ *
+ * @param context   Pointer to the MemoryStreamContext.
+ * @param offset    Offset to seek to.
+ * @param mode      Seek mode (Start, Current, End).
+ *
+ * @return New position on success, or -1 on error.
+ */
 intptr_t mem_seek(struct StreamContext *context, intptr_t offset, C2paSeekMode mode) {
     MemoryStreamContext *ctx = (MemoryStreamContext *)context;
     size_t new_pos;
@@ -68,40 +105,77 @@ intptr_t mem_seek(struct StreamContext *context, intptr_t offset, C2paSeekMode m
 }
 
 
-typedef struct {
-    C2paStream *stream;
-    MemoryStreamContext *ctx;
-} OwnedMemoryStream;
-
-OwnedMemoryStream* create_owned_memory_stream() {
+/**
+ * create_memory_stream: Creates a new memory stream with an initial buffer size.
+ *
+ * @param initial_size   Initial size of the buffer to allocate.
+ *
+ * @return Pointer to a newly allocated MemoryStream, or NULL on error.
+ *         Caller MUST free it using free_memory_stream().
+ */
+MemoryStream* create_memory_stream(size_t initial_size) {
     MemoryStreamContext *ctx = calloc(1, sizeof(MemoryStreamContext));
     if (!ctx) return NULL;
+
+    if (initial_size > 0) {
+        ctx->buffer = malloc(initial_size);
+        if (!ctx->buffer) {
+            free(ctx);
+            return NULL;
+        }
+        ctx->capacity = initial_size;
+        ctx->length = 0;
+        ctx->pos = 0;
+    }
 
     C2paStream *stream = c2pa_create_stream(
         (struct StreamContext *)ctx, mem_read, mem_seek, mem_write, mem_flush
     );
 
-
     if (!stream) {
+        if (ctx->buffer) free(ctx->buffer);
         free(ctx);
         return NULL;
     }
 
-    OwnedMemoryStream *owned = malloc(sizeof(OwnedMemoryStream));
-    owned->stream = stream;
-    owned->ctx = ctx;
-    return owned;
+    MemoryStream *mem_stream = malloc(sizeof(MemoryStream));
+    mem_stream->stream = stream;
+    mem_stream->ctx = ctx;
+    return mem_stream;
 }
 
-void free_owned_memory_stream(OwnedMemoryStream *owned) {
-    if (!owned) return;
-    c2pa_release_stream(owned->stream);
-    free(owned->ctx->buffer);
-    free(owned->ctx);
-    free(owned);
+int write_memory_stream_to_file(MemoryStream *stream, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    fwrite(stream->ctx->buffer, 1, stream->ctx->length, f);
+    fclose(f);
+    return 0;
 }
 
-// Utility: read an entire file into a malloc’d C string
+/**
+ * free_memory_stream: Frees a MemoryStream and its associated resources.
+ *
+ * @param mem_stream   Pointer to the MemoryStream to free.
+ *
+ * @return None.
+ */
+void free_memory_stream(MemoryStream *mem_stream) {
+    if (!mem_stream) return;
+    c2pa_release_stream(mem_stream->stream);
+    free(mem_stream->ctx->buffer);
+    free(mem_stream->ctx);
+    free(mem_stream);
+}
+
+// ------ Utility helpers ------
+/**
+ * read_file_to_cstring: Reads an entire file into a malloc'd C string.
+ *
+ * @param path   Path to the file to read.
+ *
+ * @return Pointer to a newly allocated null-terminated string containing file contents,
+ *         or NULL on error. Caller must free the returned string.
+ */
 char *read_file_to_cstring(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -122,209 +196,42 @@ char *read_file_to_cstring(const char *path) {
     return buf;
 }
 
-OwnedMemoryStream* create_owned_memory_stream_from_file(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    rewind(f);
-
-    MemoryStreamContext *ctx = calloc(1, sizeof(MemoryStreamContext));
-    ctx->buffer = malloc(len);
-    if (!ctx->buffer) {
-        fclose(f);
-        free(ctx);
-        return NULL;
-    }
-    fread(ctx->buffer, 1, len, f);
-    fclose(f);
-
-    ctx->length = len;
-    ctx->capacity = len;
-    ctx->pos = 0;
-
-    C2paStream *stream = c2pa_create_stream(
-        (struct StreamContext *)ctx, mem_read, mem_seek, mem_write, mem_flush
-    );
-
-    OwnedMemoryStream *owned = malloc(sizeof(OwnedMemoryStream));
-    owned->stream = stream;
-    owned->ctx = ctx;
-    return owned;
-}
-
-int write_owned_memory_stream_to_file(OwnedMemoryStream *owned, const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    fwrite(owned->ctx->buffer, 1, owned->ctx->length, f);
-    fclose(f);
-    return 0;
-}
-
-bool check_for_provenance(const char *recipe, bool *detailed) {
-    bool prov_check = false;
-    if (detailed) *detailed = false;
-
-    cJSON *recipe_json = cJSON_Parse(recipe);
-    if (recipe_json) {
-        cJSON *provenance = cJSON_GetObjectItem(recipe_json, "provenance");
-        if (provenance && cJSON_IsObject(provenance)) {
-            prov_check = true;
-            if (detailed) {
-                cJSON *detailed_field = cJSON_GetObjectItem(provenance, "detailed");
-                if (detailed_field && cJSON_IsTrue(detailed_field)) {
-                    *detailed = true;
-                }
-            }
-        }
-        cJSON_Delete(recipe_json);
-    }
-    return prov_check;
-}
-
 /**
- * Populates a C2PA manifest JSON string using cJSON.
+ * get_mime_type: Infers the MIME type of a file from its extension.
  *
- * @param filename         The source filename to set as "title".
- * @param mimetype         The MIME type to set as "format".
- * @param recipe           A JSON string with an "manipulations" array (optional unless detailed=true).
- * @param c2pa_manifest    An input base manifest that will be deep-copied and updated.
- * @param detailed         If true, parse the recipe/manipulations and append mapped actions.
+ * @param filename   Path or name of the file.
  *
- * @return A newly allocated JSON string (compact) on success, or NULL on error.
- *         Caller must free it using cJSON_free() (or free() if default allocators are used).
+ * @return A string representing the MIME type (e.g., "image/png").
+ *         Defaults to NULL if unknown.
  */
-char *populate_manifest(const char *filename,
-                        char *mimetype,
-                        const char *recipe,
-                        char *c2pa_manifest,
-                        bool detailed)
-{
-    if (!filename || !mimetype || !c2pa_manifest || !recipe) {
-        printf("Invalid arguments: filename/mimetype/manifest/recipe.\n");
-        return NULL;
-    }
-
-    // Deep copy the provided manifest
-    cJSON *base_manifest = cJSON_Parse(c2pa_manifest);
-    cJSON *manifest = cJSON_Duplicate(base_manifest, 1);
-
-    // Set "title" and "format" (mimetype)
-    cJSON_AddStringToObject(manifest, "title", filename);
-    cJSON_AddStringToObject(manifest, "format", mimetype);
-
-    cJSON *recipe_root = NULL;
-    cJSON *actions = NULL;
-
-    // If detailed is requested, parse the recipe and map manipulations to c2pa actions
-    if (detailed) {
-
-        recipe_root = cJSON_Parse(recipe);
-        if (!recipe_root) {
-            printf("Error parsing recipe JSON.\n");
-            cJSON_Delete(manifest);
-            return NULL;
-        }
-
-        cJSON *manipulations = cJSON_GetObjectItemCaseSensitive(recipe_root, "manipulations");
-        if (!cJSON_IsArray(manipulations)) {
-            printf("Can't parse manipulations from imagechef recipe: 'manipulations' must be an array.\n");
-            cJSON_Delete(recipe_root);
-            cJSON_Delete(manifest);
-            return NULL;
-        }
-
-        actions = cJSON_CreateArray();
-
-        // Iterate manipulations and map to c2pa actions
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, manipulations) {
-            cJSON *method = cJSON_GetObjectItemCaseSensitive(item, "method");
-            if (!cJSON_IsString(method) || !method->valuestring) {
-                continue; // skip invalid entries silently
-            }
-
-            const char *method_str = method->valuestring;
-            const char *action_str = NULL;
-
-            if (strcmp(method_str, "resize") == 0) {
-                action_str = "c2pa.resized";
-            } else if (strcmp(method_str, "unsharpmask") == 0 || strcmp(method_str, "sharpen") == 0) {
-                action_str = "c2pa.filtered";
-            } else if (strcmp(method_str, "stroke") == 0 || strcmp(method_str, "fill") == 0) {
-                action_str = "c2pa.drawing";
-            } else if (strcmp(method_str, "annotate") == 0) {
-                action_str = "c2pa.font.charactersAdded";
-            } else if (strcmp(method_str, "rotate") == 0) {
-                action_str = "c2pa.orientation";
-            } else if (strcmp(method_str, "cropped") == 0) {
-                action_str = "c2pa.cropped";
-            } else if (strcmp(method_str, "setformat") == 0) {
-                action_str = "c2pa.converted";
-            } else if (strcmp(method_str, "resolution") == 0) {
-                action_str = "c2pa.transcoded";
-            } else {
-                // unrecognized: skip
-                continue;
-            }
-
-            cJSON *action_obj = cJSON_CreateObject();
-
-            cJSON_AddStringToObject(action_obj, "action", action_str);
-            cJSON_AddItemToArray(actions, action_obj);
-        }
-
-        // Update manifest's assertions -> c2pa.actions -> data.actions
-        cJSON *assertions = cJSON_GetObjectItemCaseSensitive(manifest, "assertions");
-        if (cJSON_IsArray(assertions)) {
-            cJSON *assertion = NULL;
-            cJSON_ArrayForEach(assertion, assertions) {
-                cJSON *label = cJSON_GetObjectItemCaseSensitive(assertion, "label");
-                if (cJSON_IsString(label) && label->valuestring &&
-                    strcmp(label->valuestring, "c2pa.actions") == 0)
-                {
-                    cJSON *data = cJSON_GetObjectItemCaseSensitive(assertion, "data");
-                    cJSON *existing_actions = cJSON_GetObjectItemCaseSensitive(data, "actions");
-                    // Append copies of new actions
-                    cJSON *action_it = NULL;
-                    cJSON_ArrayForEach(action_it, actions) {
-                        cJSON_AddItemToArray(existing_actions, cJSON_Duplicate(action_it, 1));
-                    }
-                }
-            }
-        }
-    }
-
-    // Convert to compact string
-    char *manifest_str = cJSON_PrintUnformatted(manifest);
-
-    // Cleanup
-    if (actions) cJSON_Delete(actions);
-    if (recipe_root) cJSON_Delete(recipe_root);
-    cJSON_Delete(manifest);
-
-    // Return serialized JSON; caller must free with cJSON_free().
-    return manifest_str;
+const char *get_mime_type(const char *filename) {
+    const char *ext = strrchr(filename, '.');
+    if (!ext) return NULL;
+    if (strcmp(ext, ".png") == 0) return "image/png";
+    if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(ext, ".gif") == 0) return "image/gif";
+    if (strcmp(ext, ".webp") == 0) return "image/webp";
+    if (strcmp(ext, ".tiff") == 0 || strcmp(ext, ".tif") == 0) return "image/tiff";
+    if (strcmp(ext, ".svg") == 0) return "image/svg+xml";
+    if (strcmp(ext, ".avif") == 0) return "image/avif";
+    if (strcmp(ext, ".dng") == 0) return "image/x-adobe-dng";
+    if (strcmp(ext, ".heic") == 0) return "image/heic";
+    if (strcmp(ext, ".heif") == 0) return "image/heif";
+    return NULL;
 }
 
-// ---- Test harness ----
+
+// ---- Test ----
 
 int main() {
 
+    // define source and destination filenames
+    const char *src = "/workspace/tmp/test.png";
+    const char* dest = "/workspace/tmp/output.png";
+
     int error = 0;
 
-    char *recipe = read_file_to_cstring("/workspace/tmp/prov-detailed-bbc-1024x576.json");
-    if (!recipe) {
-        printf("Failed to read recipe file\n");
-        error = 1;
-        goto cleanup;
-    }
-    bool detailed;
-    bool provenance = check_for_provenance(recipe, &detailed);
-    printf("Provenance in recipe: %s, detailed: %s\n", provenance ? "yes" : "no", detailed ? "yes" : "no");
-
-    // Read test cert + key
+    // Read in test cert + key
     char *cert = read_file_to_cstring("/workspace/tmp/es256_certs.pem");
     char *key = read_file_to_cstring("/workspace/tmp/es256_private.key");
     if (!cert || !key) {
@@ -333,11 +240,12 @@ int main() {
         goto cleanup;
     }
 
+    // create Signer
     C2paSignerInfo info = {
         .alg = "Es256",     // or "Ed25519", etc.
         .sign_cert = cert,  // null-terminated PEM string (cert)
         .private_key = key, // null-terminated PEM string (private key)
-        .ta_url = "http://timestamp.digicert.com"
+        .ta_url = "http://timestamp.digicert.com" //optional
     };
 
     C2paSigner *signer = c2pa_signer_from_info(&info);
@@ -349,14 +257,18 @@ int main() {
         printf("Signer created successfully\n");
     }
 
-    const char *src = "/workspace/tmp/test.png";
-    const char* dest = "/workspace/tmp/output.png";
+    // get image mimetype
+    const char *mime_type = get_mime_type(src);
+    if (!mime_type) {
+        printf("Failed to determine MIME type\n");
+        error = 1;
+        goto cleanup;
+    }
 
-    char *png_mime_type = "image/png";
-    const char *base_manifest = read_file_to_cstring("/workspace/tmp/manifest.json");
+    // read in manifest
+    const char *manifest = read_file_to_cstring("/workspace/tmp/manifest.json");
 
-    char *manifest = populate_manifest("test.png", png_mime_type, recipe, base_manifest, detailed);
-
+    // create Builder
     C2paBuilder *builder = c2pa_builder_from_json(manifest);
     if (!builder) {
         printf("Failed to create builder: %s\n", c2pa_error());
@@ -366,67 +278,88 @@ int main() {
         printf("Builder created successfully\n");
     }
 
-    // char *res = c2pa_sign_file(src, dest, empty_manifest, &info, NULL);
-    // if (!res) {
-    //     printf("Signing failed: %s\n", c2pa_error());
-    //     error = 1;
-    //     goto cleanup;
-    // } else {
-    //     printf("Image signed successfully!\n");
-    // }
+    // Load input image data into source stream
+    // Read image file into buffer and get size
+    FILE *f = fopen(src, "rb");
+    if (!f) {
+        printf("Failed to open source image file\n");
+        error = 1;
+        goto cleanup;
+    }
+    fseek(f, 0, SEEK_END);
+    long img_size = ftell(f);
+    rewind(f);
 
-    const char* dest_2 = "/workspace/tmp/output_2.png";
-    const unsigned char *manifest_bytes = NULL;
+    uint8_t *img_buffer = malloc(img_size);
+    if (!img_buffer) { 
+        fclose(f);
+        printf("Failed to allocate memory for image\n");
+        error = 1;
+        goto cleanup;
+    }
+    fread(img_buffer, 1, img_size, f);
+    fclose(f);
 
-    // Load input PNG into source stream
-    OwnedMemoryStream *src_stream = create_owned_memory_stream_from_file(src);
-    if (!src_stream) {
+    // Create memory stream with image size
+    MemoryStream *src_stream = create_memory_stream(img_size);
+    if (!src_stream) { 
+        free(img_buffer);
         printf("Failed to create source stream\n");
         error = 1;
         goto cleanup;
     }
 
-    // Create empty destination stream
-    OwnedMemoryStream *dest_stream = create_owned_memory_stream();
+    // Write image data to the stream
+    src_stream->stream->writer(src_stream->stream->context, img_buffer, img_size);
+
+    // Reset position to start for reading
+    src_stream->stream->seeker(src_stream->stream->context, 0, 0);
+
+    // Free the buffer after writing to stream
+    free(img_buffer);
+
+    // Create destination stream
+    // get reserve size
+    int64_t reserve_size = c2pa_signer_reserve_size(signer);
+    // allocate size for image + signature
+    size_t dest_size = img_size + reserve_size;
+    MemoryStream *dest_stream = create_memory_stream(dest_size);
     if (!dest_stream) {
         printf("Failed to create destination stream\n");
         error = 1;
         goto cleanup;
     }
 
-    printf("builder=%p, src_stream=%p, dest_stream=%p, signer=%p\n", builder, src_stream, dest_stream, signer);
-
-    int size = c2pa_builder_sign(builder, png_mime_type, src_stream->stream, dest_stream->stream, signer, &manifest_bytes);
+    // Sign the image
+    const unsigned char *manifest_bytes = NULL;
+    int size = c2pa_builder_sign(builder, mime_type, src_stream->stream, dest_stream->stream, signer, &manifest_bytes);
     if (size == -1) {
-        printf("c2pa_builder_sign failed: %s\n", c2pa_error());
+        printf("Signing failed: %s\n", c2pa_error());
         error = 1;
         goto cleanup;
     } else {
-        printf("c2pa_builder_sign succeeded, size: %d\n", size);
+        printf("Signing successful\n");
     }
 
-    // Write signed PNG from dest_stream to disk
-    if (write_owned_memory_stream_to_file(dest_stream, dest_2) != 0) {
-        printf("Failed to write output PNG\n");
+    // Write signed image from dest_stream to disk
+    if (write_memory_stream_to_file(dest_stream, dest) != 0) {
+        printf("Failed to write output image\n");
         error = 1;
         goto cleanup;
     } else {
-        printf("Signed PNG written to %s\n", dest_2);
+        printf("Signed image written to %s\n", dest);
     }
 
     // Clean up
 cleanup:
-    if (src_stream) free_owned_memory_stream(src_stream);
-    if (dest_stream) free_owned_memory_stream(dest_stream);
+    if (src_stream) free_memory_stream(src_stream);
+    if (dest_stream) free_memory_stream(dest_stream);
     if (manifest_bytes != NULL) c2pa_manifest_bytes_free(manifest_bytes);
-    //if (res) c2pa_string_free(res);
     if (builder) c2pa_builder_free(builder);
     if (signer) c2pa_signer_free(signer);
-    if (base_manifest) free(base_manifest);
     if (manifest) free(manifest);
     if (cert) free(cert);
     if (key) free(key);
-    if (recipe) free(recipe);
     if (error == 1) return 1;
 
     return 0;
