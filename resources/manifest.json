@@ -1,0 +1,26 @@
+{
+  "claim_version": 2,
+  "claim_generator_info": [
+    {
+      "name": "C2PA Test",
+      "version": "0.2"
+    }
+  ],
+  "ingredients": [
+      {
+          "relationship": "parentOf",
+          "label": "0"
+      }
+  ],
+  "assertions": [
+    { "label": "c2pa.actions",
+      "data": {
+        "actions": [
+            {
+                "action": "c2pa.published"
+            }
+        ]
+      }
+    }
+  ]
+}
